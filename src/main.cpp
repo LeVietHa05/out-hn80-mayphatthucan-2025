@@ -31,11 +31,13 @@
 #define SERVO_MAX 600                                         // 180° position
 
 // ===== Load Cell Configuration =====
-#define LOAD_CELL_CALIBRATION_FACTOR 1000.0                   // Calibration factor (adjust based on your load cell)
-#define TARGET_WEIGHT_GRAMS 100.0                             // Target weight in grams (adjust as needed)
-#define WEIGHT_TOLERANCE 5.0                                  // Acceptable weight tolerance in grams
-#define MAX_RETRIES 3                                         // Maximum number of retry attempts
-#define LOAD_CELL_READINGS 10                                 // Number of readings to average
+#define LOAD_CELL_CALIBRATION_FACTOR 1000.0 // Calibration factor (adjust based on your load cell)
+#define WEIGHT_TOLERANCE 5.0                // Acceptable weight tolerance in grams
+#define MAX_RETRIES 3                       // Maximum number of retry attempts
+#define LOAD_CELL_READINGS 10               // Number of readings to average
+
+// ===== Drop Point Sequence Configuration =====
+#define NUM_DROP_POINTS 3 // Number of drop points to visit
 
 // ===== Servo (PCA9685) =====
 // Two PCA9685 boards: one for above servos (0x40), one for below servos (0x41)
@@ -63,6 +65,10 @@ struct Position
 Position currentPos;
 Position targetPos;
 
+// ===== Sequence State =====
+int currentSequenceIndex = 0;
+bool sequenceRunning = false;
+
 // ===== Position to Servo Mapping =====
 // Define 9 positions in a 3x3 grid (adjust coordinates based on your setup)
 struct DropPoint
@@ -71,6 +77,22 @@ struct DropPoint
   float y;
   int servoIndex;
 };
+
+DropPoint origin = {0, 325, 0};
+
+// ===== Sequence Drop Points =====
+// Define drop points to visit with their target weights
+struct SequencePoint
+{
+  float x;
+  float y;
+  int servoIndex;
+  float targetWeight;
+};
+
+// Dynamic sequence array
+SequencePoint sequencePoints[9]; // Maximum 9 points
+int numSequencePoints = 0;
 
 // TODO: test position
 DropPoint dropPoints[9] = {
@@ -92,11 +114,12 @@ void setupLoadCell();
 void moveToPosition(float x, float y);
 bool isAtTarget();
 int getServoForPosition(float x, float y);
-void activateServo(int servoIndex);
+void activateServo(int servoIndex, float targetWeight);
 void parseSerialCommand();
+void parseSequenceCommand(String command);
 void printStatus();
 float readLoadCell();
-bool isWeightSufficient(float weight);
+bool isWeightSufficient(float weight, float targetWeight);
 
 void setup()
 {
@@ -133,6 +156,9 @@ void loop()
   stepperX.run();
   stepperY.run();
 
+  // Handle sequence if running
+  handleSequence();
+
   // Check if movement is complete
   if (currentPos.isMoving && isAtTarget())
   {
@@ -140,13 +166,19 @@ void loop()
     currentPos.x = targetPos.x;
     currentPos.y = targetPos.y;
 
-    // Activate the corresponding servo
-    int servoIndex = getServoForPosition(currentPos.x, currentPos.y);
-    if (servoIndex >= 0)
+    // Only activate servo if not running a sequence (sequence handles its own activation)
+    if (!sequenceRunning)
     {
-      activateServo(servoIndex);
-      Serial.printf("Arrived at (%.1f, %.1f) - Activated servo %d\n",
-                    currentPos.x, currentPos.y, servoIndex);
+      // Activate the corresponding servo for single position moves
+      int servoIndex = getServoForPosition(currentPos.x, currentPos.y);
+      if (servoIndex >= 0)
+      {
+        // Use default target weight for single moves
+        float targetWeight = 100.0;
+        activateServo(servoIndex, targetWeight);
+        Serial.printf("Arrived at (%.1f, %.1f) - Activated servo %d\n",
+                      currentPos.x, currentPos.y, servoIndex);
+      }
     }
 
     printStatus();
@@ -262,11 +294,11 @@ int getServoForPosition(float x, float y)
   return -1; // No servo to activate
 }
 
-void activateServo(int servoIndex)
+void activateServo(int servoIndex, float targetWeight)
 {
   if (servoIndex >= 0 && servoIndex < 9)
   {
-    Serial.printf("Activating servo %d with load cell verification...\n", servoIndex);
+    Serial.printf("Activating servo %d with load cell verification (target: %.1f g)...\n", servoIndex, targetWeight);
 
     bool itemDropped = false;
     int retryCount = 0;
@@ -298,14 +330,14 @@ void activateServo(int servoIndex)
       float weight = readLoadCell();
       Serial.printf("Current weight: %.1f g\n", weight);
 
-      if (isWeightSufficient(weight))
+      if (isWeightSufficient(weight, targetWeight))
       {
-        Serial.printf("Item detected! Weight: %.1f g\n", weight);
+        Serial.printf("Item detected! Weight: %.1f g (target: %.1f g)\n", weight, targetWeight);
         itemDropped = true;
       }
       else
       {
-        Serial.printf("Insufficient weight (%.1f g). Retrying...\n", weight);
+        Serial.printf("Insufficient weight (%.1f g, target: %.1f g). Retrying...\n", weight, targetWeight);
         retryCount++;
         delay(1000); // Wait before retry
       }
@@ -333,18 +365,31 @@ void parseSerialCommand()
     {
       if (inputBuffer.length() > 0)
       {
-        // Parse "X,Y" format
-        int commaIndex = inputBuffer.indexOf(',');
-        if (commaIndex > 0)
+        // Check for sequence command
+        if (inputBuffer.equalsIgnoreCase("sequence") || inputBuffer.equalsIgnoreCase("start"))
         {
-          float x = inputBuffer.substring(0, commaIndex).toFloat();
-          float y = inputBuffer.substring(commaIndex + 1).toFloat();
-
-          moveToPosition(x, y);
+          startSequence();
+        }
+        else if (inputBuffer.indexOf(';') > 0)
+        {
+          // Parse sequence format: "1,300;5,100;9,200;"
+          parseSequenceCommand(inputBuffer);
         }
         else
         {
-          Serial.println("Invalid format! Use: X,Y (e.g., 100,50)");
+          // Parse "X,Y" format
+          int commaIndex = inputBuffer.indexOf(',');
+          if (commaIndex > 0)
+          {
+            float x = inputBuffer.substring(0, commaIndex).toFloat();
+            float y = inputBuffer.substring(commaIndex + 1).toFloat();
+
+            moveToPosition(x, y);
+          }
+          else
+          {
+            Serial.println("Invalid format! Use: X,Y (e.g., 100,50), 'sequence' to start, or e.g., '1,300;5,100;9,200;' for custom sequence");
+          }
         }
         inputBuffer = "";
       }
@@ -378,7 +423,93 @@ float readLoadCell()
   return total / LOAD_CELL_READINGS;
 }
 
-bool isWeightSufficient(float weight)
+bool isWeightSufficient(float weight, float targetWeight)
 {
-  return weight >= (TARGET_WEIGHT_GRAMS - WEIGHT_TOLERANCE);
+  return weight >= (targetWeight - WEIGHT_TOLERANCE);
+}
+
+void parseSequenceCommand(String command)
+{
+  // Parse format: "1,300;5,100;9,200;"
+  numSequencePoints = 0;
+  int startIndex = 0;
+  int endIndex = command.indexOf(';');
+
+  while (endIndex >= 0 && numSequencePoints < 9)
+  {
+    String pointStr = command.substring(startIndex, endIndex);
+    int commaIndex = pointStr.indexOf(',');
+
+    if (commaIndex > 0)
+    {
+      int dropPointNum = pointStr.substring(0, commaIndex).toInt();
+      float targetWeight = pointStr.substring(commaIndex + 1).toFloat();
+
+      // Validate drop point number (1-9)
+      if (dropPointNum >= 1 && dropPointNum <= 9)
+      {
+        int servoIndex = dropPointNum - 1; // Convert to 0-based index
+        sequencePoints[numSequencePoints].x = dropPoints[servoIndex].x;
+        sequencePoints[numSequencePoints].y = dropPoints[servoIndex].y;
+        sequencePoints[numSequencePoints].servoIndex = servoIndex;
+        sequencePoints[numSequencePoints].targetWeight = targetWeight;
+        numSequencePoints++;
+
+        Serial.printf("Added drop point %d (servo %d) with target weight %.1f g\n",
+                      dropPointNum, servoIndex, targetWeight);
+      }
+      else
+      {
+        Serial.printf("Invalid drop point number: %d (must be 1-9)\n", dropPointNum);
+      }
+    }
+
+    startIndex = endIndex + 1;
+    endIndex = command.indexOf(';', startIndex);
+  }
+
+  if (numSequencePoints > 0)
+  {
+    Serial.printf("Sequence configured with %d points. Send 'sequence' to start.\n", numSequencePoints);
+  }
+  else
+  {
+    Serial.println("No valid drop points found in sequence command.");
+  }
+}
+
+// ===== Sequence Functions =====
+void startSequence()
+{
+  if (!sequenceRunning)
+  {
+    sequenceRunning = true;
+    currentSequenceIndex = 0;
+    Serial.println("Starting sequence...");
+    moveToPosition(sequencePoints[currentSequenceIndex].x, sequencePoints[currentSequenceIndex].y);
+  }
+}
+
+void handleSequence()
+{
+  if (sequenceRunning && !currentPos.isMoving && currentSequenceIndex < numSequencePoints)
+  {
+    // Activate servo for current point
+    int servoIndex = sequencePoints[currentSequenceIndex].servoIndex;
+    float targetWeight = sequencePoints[currentSequenceIndex].targetWeight;
+    activateServo(servoIndex, targetWeight);
+
+    // Move to next point
+    currentSequenceIndex++;
+    if (currentSequenceIndex < numSequencePoints)
+    {
+      Serial.printf("Moving to next point %d...\n", currentSequenceIndex + 1);
+      moveToPosition(sequencePoints[currentSequenceIndex].x, sequencePoints[currentSequenceIndex].y);
+    }
+    else
+    {
+      Serial.println("Sequence complete!");
+      sequenceRunning = false;
+    }
+  }
 }
