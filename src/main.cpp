@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 #include <AccelStepper.h>
+#include <HX711.h>
 
 // ===== Pin Definitions =====
 #define STEP_PIN_X 18
@@ -10,6 +11,10 @@
 #define DIR_PIN_Y 25
 #define ENABLE_PIN_X 17
 #define ENABLE_PIN_Y 16
+
+// ===== HX711 Load Cell =====
+#define HX711_DT_PIN 32  // Data pin
+#define HX711_SCK_PIN 33 // Clock pin
 
 // ===== System Configuration =====
 #define STEPS_PER_ROUND 200
@@ -25,6 +30,13 @@
 #define SERVO_MIN 150                                         // 0° position
 #define SERVO_MAX 600                                         // 180° position
 
+// ===== Load Cell Configuration =====
+#define LOAD_CELL_CALIBRATION_FACTOR 1000.0                   // Calibration factor (adjust based on your load cell)
+#define TARGET_WEIGHT_GRAMS 100.0                             // Target weight in grams (adjust as needed)
+#define WEIGHT_TOLERANCE 5.0                                  // Acceptable weight tolerance in grams
+#define MAX_RETRIES 3                                         // Maximum number of retry attempts
+#define LOAD_CELL_READINGS 10                                 // Number of readings to average
+
 // ===== Servo (PCA9685) =====
 // Two PCA9685 boards: one for above servos (0x40), one for below servos (0x41)
 Adafruit_PWMServoDriver pwmAbove = Adafruit_PWMServoDriver(0x40);
@@ -36,6 +48,9 @@ int servoChannelsBelow[9] = {0, 1, 2, 3, 4, 5, 6, 7, 8};
 // ===== Stepper Motors =====
 AccelStepper stepperX(AccelStepper::DRIVER, STEP_PIN_X, DIR_PIN_X);
 AccelStepper stepperY(AccelStepper::DRIVER, STEP_PIN_Y, DIR_PIN_Y);
+
+// ===== HX711 Load Cell =====
+HX711 loadCell;
 
 // ===== System State =====
 struct Position
@@ -73,12 +88,15 @@ DropPoint dropPoints[9] = {
 // ===== Function Declarations =====
 void setupServos();
 void setupSteppers();
+void setupLoadCell();
 void moveToPosition(float x, float y);
 bool isAtTarget();
 int getServoForPosition(float x, float y);
 void activateServo(int servoIndex);
 void parseSerialCommand();
 void printStatus();
+float readLoadCell();
+bool isWeightSufficient(float weight);
 
 void setup()
 {
@@ -91,6 +109,7 @@ void setup()
   // Setup components
   setupServos();
   setupSteppers();
+  setupLoadCell();
 
   // Set initial position
   currentPos.x = 0;
@@ -171,6 +190,23 @@ void setupSteppers()
   Serial.println("Stepper motors ready");
 }
 
+void setupLoadCell()
+{
+  Serial.println("Setting up load cell...");
+
+  // Initialize HX711
+  loadCell.begin(HX711_DT_PIN, HX711_SCK_PIN);
+
+  // Set calibration factor (adjust based on your load cell)
+  loadCell.set_scale(LOAD_CELL_CALIBRATION_FACTOR);
+
+  // Tare (zero) the scale
+  Serial.println("Taring load cell... Please ensure no weight is on the scale.");
+  loadCell.tare(); // Reset the scale to 0
+
+  Serial.println("Load cell ready");
+}
+
 void moveToPosition(float x, float y)
 {
   // Check boundaries
@@ -230,25 +266,59 @@ void activateServo(int servoIndex)
 {
   if (servoIndex >= 0 && servoIndex < 9)
   {
-    Serial.printf("Activating servo %d: Above servo opens for 5s...\n", servoIndex);
+    Serial.printf("Activating servo %d with load cell verification...\n", servoIndex);
 
-    // Open above servo (180°) for 5 seconds
-    pwmAbove.setPWM(servoChannelsAbove[servoIndex], 0, SERVO_MAX);
-    delay(5000); // Keep open for 5 seconds
+    bool itemDropped = false;
+    int retryCount = 0;
 
-    // Close above servo (0°)
-    pwmAbove.setPWM(servoChannelsAbove[servoIndex], 0, SERVO_MIN);
+    // Retry loop
+    while (!itemDropped && retryCount < MAX_RETRIES)
+    {
+      Serial.printf("Attempt %d: Opening above servo for 5s...\n", retryCount + 1);
 
-    Serial.printf("Above servo closed. Below servo opens for 5s...\n");
+      // Open above servo (180°) for 5 seconds
+      pwmAbove.setPWM(servoChannelsAbove[servoIndex], 0, SERVO_MAX);
+      delay(5000); // Keep open for 5 seconds
 
-    // Open below servo (180°) for 5 seconds
-    pwmBelow.setPWM(servoChannelsBelow[servoIndex], 0, SERVO_MAX);
-    delay(5000); // Keep open for 5 seconds
+      // Close above servo (0°)
+      pwmAbove.setPWM(servoChannelsAbove[servoIndex], 0, SERVO_MIN);
 
-    // Close below servo (0°)
-    pwmBelow.setPWM(servoChannelsBelow[servoIndex], 0, SERVO_MIN);
+      Serial.printf("Above servo closed. Opening below servo for 5s...\n");
 
-    Serial.printf("Below servo closed. Servo %d activation complete.\n", servoIndex);
+      // Open below servo (180°) for 5 seconds
+      pwmBelow.setPWM(servoChannelsBelow[servoIndex], 0, SERVO_MAX);
+      delay(5000); // Keep open for 5 seconds
+
+      // Close below servo (0°)
+      pwmBelow.setPWM(servoChannelsBelow[servoIndex], 0, SERVO_MIN);
+
+      Serial.printf("Below servo closed. Checking weight...\n");
+
+      // Check weight after both servos have operated
+      float weight = readLoadCell();
+      Serial.printf("Current weight: %.1f g\n", weight);
+
+      if (isWeightSufficient(weight))
+      {
+        Serial.printf("Item detected! Weight: %.1f g\n", weight);
+        itemDropped = true;
+      }
+      else
+      {
+        Serial.printf("Insufficient weight (%.1f g). Retrying...\n", weight);
+        retryCount++;
+        delay(1000); // Wait before retry
+      }
+    }
+
+    if (itemDropped)
+    {
+      Serial.printf("Servo %d activation complete - Item successfully caught.\n", servoIndex);
+    }
+    else
+    {
+      Serial.printf("Failed to catch item after %d attempts. Servo %d activation failed.\n", MAX_RETRIES, servoIndex);
+    }
   }
 }
 
@@ -294,4 +364,21 @@ void printStatus()
     Serial.printf(" -> Target: (%.1f, %.1f) mm", targetPos.x, targetPos.y);
   }
   Serial.println();
+}
+
+float readLoadCell()
+{
+  // Take multiple readings and average them for better accuracy
+  float total = 0;
+  for (int i = 0; i < LOAD_CELL_READINGS; i++)
+  {
+    total += loadCell.get_units();
+    delay(10); // Small delay between readings
+  }
+  return total / LOAD_CELL_READINGS;
+}
+
+bool isWeightSufficient(float weight)
+{
+  return weight >= (TARGET_WEIGHT_GRAMS - WEIGHT_TOLERANCE);
 }
