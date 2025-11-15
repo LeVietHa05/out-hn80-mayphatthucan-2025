@@ -5,8 +5,8 @@
 #include <HX711.h>
 
 // ===== Pin Definitions =====
-#define STEP_PIN_X 18
-#define DIR_PIN_X 19
+#define STEP_PIN_X 19
+#define DIR_PIN_X 18
 #define STEP_PIN_Y 23
 #define DIR_PIN_Y 25
 #define ENABLE_PIN_X 17
@@ -120,6 +120,8 @@ void parseSequenceCommand(String command);
 void printStatus();
 float readLoadCell();
 bool isWeightSufficient(float weight, float targetWeight);
+void startSequence();
+void handleSequence();
 
 void setup()
 {
