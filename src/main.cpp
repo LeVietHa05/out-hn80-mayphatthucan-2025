@@ -3,6 +3,7 @@
 #include <Adafruit_PWMServoDriver.h>
 #include <AccelStepper.h>
 #include <HX711.h>
+#include <WiFiManager.h>
 
 // ===== Pin Definitions =====
 #define STEP_PIN_X 19
@@ -128,6 +129,20 @@ void setup()
   Serial.begin(115200);
   Serial.println("=== XY Servo Catcher System Starting ===");
 
+  // WiFiManager setup
+  WiFiManager wm;
+  wm.setConfigPortalTimeout(180); // 3 minutes to configure
+  if (!wm.autoConnect("KHKT FOOD CATCHER"))
+  {
+    Serial.println("Failed to connect to WiFi, continuing without WiFi...");
+  }
+  else
+  {
+    Serial.println("WiFi connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  }
+
   // Initialize I2C for servo driver
   Wire.begin();
 
@@ -148,6 +163,14 @@ void setup()
 
 void loop()
 {
+  // WiFi auto reconnect
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("WiFi disconnected, attempting to reconnect...");
+    WiFi.reconnect();
+    delay(5000); // Wait 5 seconds before checking again
+  }
+
   // Handle serial communication
   if (Serial.available() > 0)
   {

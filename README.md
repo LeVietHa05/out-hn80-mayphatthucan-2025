@@ -78,6 +78,7 @@ This Arduino sketch provides a simple way to test stepper motors using serial co
 - AccelStepper library
 - Adafruit_PWMServoDriver library (for main.cpp)
 - HX711 library (for main.cpp)
+- WiFiManager library (for main.cpp)
 
 ## Usage
 1. For testing: Upload `test_stepper.ino`, use Serial Monitor with commands like "X100".
