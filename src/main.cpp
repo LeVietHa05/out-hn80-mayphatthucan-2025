@@ -19,7 +19,7 @@
 
 // ===== System Configuration =====
 #define STEPS_PER_ROUND 200
-#define MICROSTEP 16 // MS2, MS1: 00: 1/8, 01: 1/32, 10: 1/64 11: 1/16
+#define MICROSTEP 4 // MS2, MS1: 00: 1/8, 01: 1/32, 10: 1/64 11: 1/16
 // Lead screw: Tr10x8 (8mm lead per revolution)
 #define LEADSCREW 8
 // Stepper: 200 steps/rev with 16 microstepping = 3200 steps/rev
@@ -36,6 +36,10 @@
 #define WEIGHT_TOLERANCE 5.0                // Acceptable weight tolerance in grams
 #define MAX_RETRIES 3                       // Maximum number of retry attempts
 #define LOAD_CELL_READINGS 10               // Number of readings to average
+
+#define SERVER "localhost"
+#define PORT 3000
+#define API '/api/order'
 
 // ===== Drop Point Sequence Configuration =====
 #define NUM_DROP_POINTS 3 // Number of drop points to visit
