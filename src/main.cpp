@@ -2,16 +2,21 @@
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 #include <AccelStepper.h>
-#include <HX711.h>
+// #include <HX711.h>
 #include <WiFiManager.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 
 // ===== Pin Definitions =====
 #define STEP_PIN_X 19
 #define DIR_PIN_X 18
-#define STEP_PIN_Y 23
-#define DIR_PIN_Y 25
+#define STEP_PIN_Y 25
+#define DIR_PIN_Y 23
 #define ENABLE_PIN_X 17
 #define ENABLE_PIN_Y 16
+
+#define LIMIT_SWITCH1_PIN 32 // check
+#define LIMIT_SWITCH2_PIN 33 // check
 
 // ===== HX711 Load Cell =====
 #define HX711_DT_PIN 32  // Data pin
@@ -26,8 +31,8 @@
 // Steps per mm: 3200 / 8 = 400 steps per mm
 #define STEPS_PER_MM_X STEPS_PER_ROUND *MICROSTEP / LEADSCREW // Tr10x8 lead screw with 16 microstepping
 #define STEPS_PER_MM_Y STEPS_PER_ROUND *MICROSTEP / LEADSCREW // Tr10x8 lead screw with 16 microstepping
-#define MAX_X_MM 545                                          // Maximum X travel in mm
-#define MAX_Y_MM 675                                          // Maximum Y travel in mm
+#define MAX_X_MM 560                                          // Maximum X travel in mm
+#define MAX_Y_MM 310                                          // Maximum Y travel in mm
 #define SERVO_MIN 150                                         // 0° position
 #define SERVO_MAX 600                                         // 180° position
 
@@ -37,9 +42,14 @@
 #define MAX_RETRIES 3                       // Maximum number of retry attempts
 #define LOAD_CELL_READINGS 10               // Number of readings to average
 
-#define SERVER "localhost"
+#define SERVER "172.16.30.209"
 #define PORT 3000
-#define API '/api/order'
+#define API "/api/claim/queue" // get the latest order from server
+
+String currentQueueCode = ""; // queue code
+int currentQueueID = 0;       // queue id
+String scurLocations = "";    // string of locationlist
+int locationList[] = {};      // list of drop point + 1
 
 // ===== Drop Point Sequence Configuration =====
 #define NUM_DROP_POINTS 3 // Number of drop points to visit
@@ -57,18 +67,7 @@ AccelStepper stepperX(AccelStepper::DRIVER, STEP_PIN_X, DIR_PIN_X);
 AccelStepper stepperY(AccelStepper::DRIVER, STEP_PIN_Y, DIR_PIN_Y);
 
 // ===== HX711 Load Cell =====
-HX711 loadCell;
-
-// ===== System State =====
-struct Position
-{
-  float x = 0.0;
-  float y = 0.0;
-  bool isMoving = false;
-};
-
-Position currentPos;
-Position targetPos;
+// HX711 loadCell;
 
 // ===== Sequence State =====
 int currentSequenceIndex = 0;
@@ -83,7 +82,7 @@ struct DropPoint
   int servoIndex;
 };
 
-DropPoint origin = {0, 325, 0};
+DropPoint origin = {0, 0, 0};
 
 // ===== Sequence Drop Points =====
 // Define drop points to visit with their target weights
@@ -101,32 +100,31 @@ int numSequencePoints = 0;
 
 // TODO: test position
 DropPoint dropPoints[9] = {
-    {536, 505, 0}, // Position 1 -> Servo 0
-    {536, 325, 1}, // Position 2 -> Servo 1
-    {536, 145, 2}, // Position 3 -> Servo 2
-    {356, 505, 3}, // Position 4 -> Servo 3
-    {356, 325, 4}, // Position 5 -> Servo 4
-    {356, 145, 5}, // Position 6 -> Servo 5
-    {176, 505, 6}, // Position 7 -> Servo 6
-    {176, 325, 7}, // Position 8 -> Servo 7
-    {176, 145, 8}  // Position 9 -> Servo 8
+    {560, 150, 0}, // Position 1 -> Servo 0
+    {370, 150, 1}, // Position 2 -> Servo 1
+    {190, 140, 2}, // Position 3 -> Servo 2
+    {560, 75, 3},  // Position 4 -> Servo 3
+    {370, 75, 4},  // Position 5 -> Servo 4
+    {190, 75, 5},  // Position 6 -> Servo 5
+    {560, 0, 6},   // Position 7 -> Servo 6
+    {370, 0, 7},   // Position 8 -> Servo 7
+    {190, 0, 8}    // Position 9 -> Servo 8
 };
 
 // ===== Function Declarations =====
 void setupServos();
 void setupSteppers();
-void setupLoadCell();
+// void setupLoadCell();
 void moveToPosition(float x, float y);
-bool isAtTarget();
-int getServoForPosition(float x, float y);
 void activateServo(int servoIndex, float targetWeight);
-void parseSerialCommand();
-void parseSequenceCommand(String command);
 void printStatus();
-float readLoadCell();
+// float readLoadCell();
 bool isWeightSufficient(float weight, float targetWeight);
-void startSequence();
-void handleSequence();
+bool homeSteppersAdvanced(float homeSpeed = 2000, float maxSpeed = 2000,
+                          int backoffDistance = 400, unsigned long timeout = 30000);
+void fetchQueueFromServer();
+int parseStringToSortedArray(const String &input, int output[], int maxSize);
+void runQueue();
 
 void setup()
 {
@@ -148,18 +146,18 @@ void setup()
   }
 
   // Initialize I2C for servo driver
-  Wire.begin();
+  Wire.begin(22, 21);
 
   // Setup components
   setupServos();
   setupSteppers();
-  setupLoadCell();
+  // setupLoadCell();
 
-  // Set initial position
-  currentPos.x = 0;
-  currentPos.y = 0;
-  targetPos.x = 0;
-  targetPos.y = 0;
+  // limit switch setup
+  pinMode(LIMIT_SWITCH1_PIN, INPUT_PULLUP);
+  pinMode(LIMIT_SWITCH2_PIN, INPUT_PULLUP);
+
+  homeSteppersAdvanced(2000);
 
   Serial.println("System ready! Send coordinates as 'X,Y' (e.g., '100,50')");
   printStatus();
@@ -174,43 +172,21 @@ void loop()
     WiFi.reconnect();
     delay(5000); // Wait 5 seconds before checking again
   }
-
-  // Handle serial communication
-  if (Serial.available() > 0)
+  static unsigned long lastCheckServer = 0;
+  if (millis() - lastCheckServer > 5000)
   {
-    parseSerialCommand();
+    // fetchQueueFromServer();
+    lastCheckServer = millis();
   }
 
-  // Run steppers (non-blocking)
-  stepperX.run();
-  stepperY.run();
-
-  // Handle sequence if running
-  handleSequence();
-
-  // Check if movement is complete
-  if (currentPos.isMoving && isAtTarget())
+  if (Serial.available())
   {
-    currentPos.isMoving = false;
-    currentPos.x = targetPos.x;
-    currentPos.y = targetPos.y;
-
-    // Only activate servo if not running a sequence (sequence handles its own activation)
-    if (!sequenceRunning)
+    int slot = Serial.readStringUntil('\n').toInt();
+    if (slot >= 0 && slot <= 8)
     {
-      // Activate the corresponding servo for single position moves
-      int servoIndex = getServoForPosition(currentPos.x, currentPos.y);
-      if (servoIndex >= 0)
-      {
-        // Use default target weight for single moves
-        float targetWeight = 100.0;
-        activateServo(servoIndex, targetWeight);
-        Serial.printf("Arrived at (%.1f, %.1f) - Activated servo %d\n",
-                      currentPos.x, currentPos.y, servoIndex);
-      }
+      DropPoint point = dropPoints[slot];
+      moveToPosition(point.x, point.y);
     }
-
-    printStatus();
   }
 }
 
@@ -220,11 +196,11 @@ void setupServos()
 
   // Initialize above servos (PCA9685 at 0x40)
   pwmAbove.begin();
-  pwmAbove.setPWMFreq(50); // 50Hz for servo motors
+  pwmAbove.setPWMFreq(60); // 50Hz for servo motors
 
   // Initialize below servos (PCA9685 at 0x41)
   pwmBelow.begin();
-  pwmBelow.setPWMFreq(50); // 50Hz for servo motors
+  pwmBelow.setPWMFreq(60); // 50Hz for servo motors
 
   // Initialize all 18 servos to closed position (0°)
   for (int i = 0; i < 9; i++)
@@ -240,34 +216,42 @@ void setupSteppers()
   Serial.println("Setting up stepper motors...");
 
   // Configure stepper parameters
-  stepperX.setMaxSpeed(1000);    // steps per second
-  stepperX.setAcceleration(500); // steps per second²
+  stepperX.setMaxSpeed(3000);     // steps per second
+  stepperX.setAcceleration(1000); // steps per second²
   stepperX.setSpeed(200);
+  stepperX.setEnablePin(ENABLE_PIN_X);
+  stepperX.enableOutputs();
 
-  stepperY.setMaxSpeed(1000);
-  stepperY.setAcceleration(500);
+  stepperY.setMaxSpeed(3000);
+  stepperY.setAcceleration(1000);
   stepperY.setSpeed(200);
+  stepperY.setEnablePin(ENABLE_PIN_Y);
+  stepperY.enableOutputs();
+
+  digitalWrite(ENABLE_PIN_X, LOW);
+  digitalWrite(ENABLE_PIN_Y, LOW);
 
   Serial.println("Stepper motors ready");
 }
 
-void setupLoadCell()
-{
-  Serial.println("Setting up load cell...");
+// void setupLoadCell()
+// {
+//   Serial.println("Setting up load cell...");
 
-  // Initialize HX711
-  loadCell.begin(HX711_DT_PIN, HX711_SCK_PIN);
+//   // Initialize HX711
+//   loadCell.begin(HX711_DT_PIN, HX711_SCK_PIN);
 
-  // Set calibration factor (adjust based on your load cell)
-  loadCell.set_scale(LOAD_CELL_CALIBRATION_FACTOR);
+//   // Set calibration factor (adjust based on your load cell)
+//   loadCell.set_scale(LOAD_CELL_CALIBRATION_FACTOR);
 
-  // Tare (zero) the scale
-  Serial.println("Taring load cell... Please ensure no weight is on the scale.");
-  loadCell.tare(); // Reset the scale to 0
+//   // Tare (zero) the scale
+//   Serial.println("Taring load cell... Please ensure no weight is on the scale.");
+//   loadCell.tare(); // Reset the scale to 0
 
-  Serial.println("Load cell ready");
-}
+//   Serial.println("Load cell ready");
+// }
 
+// move with blocking untill done
 void moveToPosition(float x, float y)
 {
   // Check boundaries
@@ -282,45 +266,16 @@ void moveToPosition(float x, float y)
   long stepsY = y * STEPS_PER_MM_Y;
 
   // Set target positions
-  stepperX.moveTo(stepsX);
+  stepperX.moveTo(-stepsX);
   stepperY.moveTo(stepsY);
 
-  // Update target position
-  targetPos.x = x;
-  targetPos.y = y;
-  currentPos.isMoving = true;
-
   Serial.printf("Moving to (%.1f, %.1f) mm...\n", x, y);
-}
 
-bool isAtTarget()
-{
-  return !stepperX.isRunning() && !stepperY.isRunning();
-}
-
-int getServoForPosition(float x, float y)
-{
-  // Find the closest drop point
-  float minDistance = 999999;
-  int closestServo = -1;
-
-  for (int i = 0; i < 9; i++)
+  while (stepperX.distanceToGo() != 0 || stepperY.distanceToGo() != 0)
   {
-    float distance = sqrt(pow(x - dropPoints[i].x, 2) + pow(y - dropPoints[i].y, 2));
-    if (distance < minDistance)
-    {
-      minDistance = distance;
-      closestServo = dropPoints[i].servoIndex;
-    }
+    stepperX.run();
+    stepperY.run();
   }
-
-  // Only activate servo if we're very close to a drop point (within 5mm)
-  if (minDistance <= 5.0)
-  {
-    return closestServo;
-  }
-
-  return -1; // No servo to activate
 }
 
 void activateServo(int servoIndex, float targetWeight)
@@ -333,123 +288,38 @@ void activateServo(int servoIndex, float targetWeight)
     int retryCount = 0;
 
     // Retry loop
-    while (!itemDropped && retryCount < MAX_RETRIES)
-    {
-      Serial.printf("Attempt %d: Opening above servo for 5s...\n", retryCount + 1);
+    // while (!itemDropped && retryCount < MAX_RETRIES)
+    // {
+    Serial.printf("Attempt %d: Opening above servo for 5s...\n", retryCount + 1);
 
-      // Open above servo (180°) for 5 seconds
-      pwmAbove.setPWM(servoChannelsAbove[servoIndex], 0, SERVO_MAX);
-      delay(5000); // Keep open for 5 seconds
+    // Open above servo (180°) for 5 seconds
+    pwmAbove.setPWM(servoChannelsAbove[servoIndex], 0, SERVO_MAX);
+    delay(5000); // Keep open for 5 seconds
 
-      // Close above servo (0°)
-      pwmAbove.setPWM(servoChannelsAbove[servoIndex], 0, SERVO_MIN);
+    // Close above servo (0°)
+    pwmAbove.setPWM(servoChannelsAbove[servoIndex], 0, SERVO_MIN);
 
-      Serial.printf("Above servo closed. Opening below servo for 5s...\n");
+    Serial.printf("Above servo closed. Opening below servo for 5s...\n");
 
-      // Open below servo (180°) for 5 seconds
-      pwmBelow.setPWM(servoChannelsBelow[servoIndex], 0, SERVO_MAX);
-      delay(5000); // Keep open for 5 seconds
+    // Open below servo (180°) for 5 seconds
+    pwmBelow.setPWM(servoChannelsBelow[servoIndex], 0, SERVO_MAX);
+    delay(5000); // Keep open for 5 seconds
 
-      // Close below servo (0°)
-      pwmBelow.setPWM(servoChannelsBelow[servoIndex], 0, SERVO_MIN);
-
-      Serial.printf("Below servo closed. Checking weight...\n");
-
-      // Check weight after both servos have operated
-      float weight = readLoadCell();
-      Serial.printf("Current weight: %.1f g\n", weight);
-
-      if (isWeightSufficient(weight, targetWeight))
-      {
-        Serial.printf("Item detected! Weight: %.1f g (target: %.1f g)\n", weight, targetWeight);
-        itemDropped = true;
-      }
-      else
-      {
-        Serial.printf("Insufficient weight (%.1f g, target: %.1f g). Retrying...\n", weight, targetWeight);
-        retryCount++;
-        delay(1000); // Wait before retry
-      }
-    }
-
-    if (itemDropped)
-    {
-      Serial.printf("Servo %d activation complete - Item successfully caught.\n", servoIndex);
-    }
-    else
-    {
-      Serial.printf("Failed to catch item after %d attempts. Servo %d activation failed.\n", MAX_RETRIES, servoIndex);
-    }
-  }
-}
-
-void parseSerialCommand()
-{
-  static String inputBuffer = "";
-
-  while (Serial.available() > 0)
-  {
-    char c = Serial.read();
-    if (c == '\n' || c == '\r')
-    {
-      if (inputBuffer.length() > 0)
-      {
-        // Check for sequence command
-        if (inputBuffer.equalsIgnoreCase("sequence") || inputBuffer.equalsIgnoreCase("start"))
-        {
-          startSequence();
-        }
-        else if (inputBuffer.indexOf(';') > 0)
-        {
-          // Parse sequence format: "1,300;5,100;9,200;"
-          parseSequenceCommand(inputBuffer);
-        }
-        else
-        {
-          // Parse "X,Y" format
-          int commaIndex = inputBuffer.indexOf(',');
-          if (commaIndex > 0)
-          {
-            float x = inputBuffer.substring(0, commaIndex).toFloat();
-            float y = inputBuffer.substring(commaIndex + 1).toFloat();
-
-            moveToPosition(x, y);
-          }
-          else
-          {
-            Serial.println("Invalid format! Use: X,Y (e.g., 100,50), 'sequence' to start, or e.g., '1,300;5,100;9,200;' for custom sequence");
-          }
-        }
-        inputBuffer = "";
-      }
-    }
-    else
-    {
-      inputBuffer += c;
-    }
+    // Close below servo (0°)
+    pwmBelow.setPWM(servoChannelsBelow[servoIndex], 0, SERVO_MIN);
+    delay(2000);
+    Serial.printf("Below servo closed. Checking weight...\n");
   }
 }
 
 void printStatus()
 {
-  Serial.printf("Current Position: (%.1f, %.1f) mm", currentPos.x, currentPos.y);
-  if (currentPos.isMoving)
-  {
-    Serial.printf(" -> Target: (%.1f, %.1f) mm", targetPos.x, targetPos.y);
-  }
+  // Serial.printf("Current Position: (%.1f, %.1f) mm", currentPos.x, currentPos.y);
+  // if (currentPos.isMoving)
+  // {
+  //   Serial.printf(" -> Target: (%.1f, %.1f) mm", targetPos.x, targetPos.y);
+  // }
   Serial.println();
-}
-
-float readLoadCell()
-{
-  // Take multiple readings and average them for better accuracy
-  float total = 0;
-  for (int i = 0; i < LOAD_CELL_READINGS; i++)
-  {
-    total += loadCell.get_units();
-    delay(10); // Small delay between readings
-  }
-  return total / LOAD_CELL_READINGS;
 }
 
 bool isWeightSufficient(float weight, float targetWeight)
@@ -457,88 +327,221 @@ bool isWeightSufficient(float weight, float targetWeight)
   return weight >= (targetWeight - WEIGHT_TOLERANCE);
 }
 
-void parseSequenceCommand(String command)
+bool homeSteppersAdvanced(float homeSpeed, float maxSpeed,
+                          int backoffDistance, unsigned long timeout)
 {
-  // Parse format: "1,300;5,100;9,200;"
-  numSequencePoints = 0;
-  int startIndex = 0;
-  int endIndex = command.indexOf(';');
+  Serial.println("=== Bắt đầu quá trình Homing ===");
 
-  while (endIndex >= 0 && numSequencePoints < 9)
+  unsigned long startTime = millis();
+  bool home1 = false;
+  bool home2 = false;
+
+  // Thiết lập tốc độ homing
+  stepperX.setMaxSpeed(maxSpeed);
+  stepperX.setSpeed(homeSpeed);
+  stepperY.setMaxSpeed(maxSpeed);
+  stepperY.setSpeed(homeSpeed);
+
+  // Bắt đầu di chuyển về phía công tắc
+  stepperX.move(1000000);
+  stepperY.move(-1000000);
+
+  while (!(home1 && home2))
   {
-    String pointStr = command.substring(startIndex, endIndex);
-    int commaIndex = pointStr.indexOf(',');
-
-    if (commaIndex > 0)
+    // Kiểm tra timeout
+    if (millis() - startTime > timeout)
     {
-      int dropPointNum = pointStr.substring(0, commaIndex).toInt();
-      float targetWeight = pointStr.substring(commaIndex + 1).toFloat();
+      Serial.println("Lỗi: Timeout trong quá trình homing!");
+      stepperX.stop();
+      stepperY.stop();
+      return false;
+    }
 
-      // Validate drop point number (1-9)
-      if (dropPointNum >= 1 && dropPointNum <= 9)
+    // Kiểm tra công tắc
+    if (!home1)
+    {
+      if (digitalRead(LIMIT_SWITCH1_PIN) == LOW)
       {
-        int servoIndex = dropPointNum - 1; // Convert to 0-based index
-        sequencePoints[numSequencePoints].x = dropPoints[servoIndex].x;
-        sequencePoints[numSequencePoints].y = dropPoints[servoIndex].y;
-        sequencePoints[numSequencePoints].servoIndex = servoIndex;
-        sequencePoints[numSequencePoints].targetWeight = targetWeight;
-        numSequencePoints++;
-
-        Serial.printf("Added drop point %d (servo %d) with target weight %.1f g\n",
-                      dropPointNum, servoIndex, targetWeight);
+        stepperX.stop();
+        stepperX.setCurrentPosition(0);
+        home1 = true;
+        Serial.println("✓ Stepper 1: Đã về home");
       }
       else
       {
-        Serial.printf("Invalid drop point number: %d (must be 1-9)\n", dropPointNum);
+        stepperX.run(); // Dùng runSpeed() để kiểm soát tốc độ
       }
     }
 
-    startIndex = endIndex + 1;
-    endIndex = command.indexOf(';', startIndex);
-  }
-
-  if (numSequencePoints > 0)
-  {
-    Serial.printf("Sequence configured with %d points. Send 'sequence' to start.\n", numSequencePoints);
-  }
-  else
-  {
-    Serial.println("No valid drop points found in sequence command.");
-  }
-}
-
-// ===== Sequence Functions =====
-void startSequence()
-{
-  if (!sequenceRunning)
-  {
-    sequenceRunning = true;
-    currentSequenceIndex = 0;
-    Serial.println("Starting sequence...");
-    moveToPosition(sequencePoints[currentSequenceIndex].x, sequencePoints[currentSequenceIndex].y);
-  }
-}
-
-void handleSequence()
-{
-  if (sequenceRunning && !currentPos.isMoving && currentSequenceIndex < numSequencePoints)
-  {
-    // Activate servo for current point
-    int servoIndex = sequencePoints[currentSequenceIndex].servoIndex;
-    float targetWeight = sequencePoints[currentSequenceIndex].targetWeight;
-    activateServo(servoIndex, targetWeight);
-
-    // Move to next point
-    currentSequenceIndex++;
-    if (currentSequenceIndex < numSequencePoints)
+    if (!home2)
     {
-      Serial.printf("Moving to next point %d...\n", currentSequenceIndex + 1);
-      moveToPosition(sequencePoints[currentSequenceIndex].x, sequencePoints[currentSequenceIndex].y);
+      if (digitalRead(LIMIT_SWITCH2_PIN) == LOW)
+      {
+        stepperY.stop();
+        stepperY.setCurrentPosition(0);
+        home2 = true;
+        Serial.println("✓ Stepper 2: Đã về home");
+      }
+      else
+      {
+        stepperY.run();
+      }
+    }
+
+    // Ngắn delay để tránh đọc switch quá nhanh
+    delay(1);
+  }
+
+  Serial.println("Đang di chuyển ra khỏi công tắc...");
+
+  // Di chuyển ngược lại với tốc độ chậm hơn
+  stepperX.setSpeed(homeSpeed / 2);
+  stepperY.setSpeed(homeSpeed / 2);
+
+  stepperX.move(-backoffDistance);
+  stepperY.move(backoffDistance);
+
+  while (stepperX.distanceToGo() != 0 || stepperY.distanceToGo() != 0)
+  {
+    stepperX.runSpeed();
+    stepperY.runSpeed();
+  }
+
+  // Đặt lại vị trí zero
+  stepperX.setCurrentPosition(0);
+  stepperY.setCurrentPosition(0);
+
+  // Khôi phục tốc độ mặc định
+  stepperX.setMaxSpeed(3000);
+  stepperY.setMaxSpeed(3000);
+
+  Serial.println("=== Homing hoàn tất thành công ===");
+  return true;
+}
+
+void fetchQueueFromServer()
+{
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    HTTPClient http;
+    String url = "http://" + String(SERVER) + ":" + String(PORT) + String(API);
+    http.begin(url);
+    int httpResponseCode = http.GET();
+
+    if (httpResponseCode > 0)
+    {
+      String response = http.getString();
+      Serial.println("GET Response: " + response);
+      // Parse the response to get the state
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, response);
+
+      if (error)
+      {
+        Serial.print("deserializeJson() failed: ");
+        Serial.println(error.c_str());
+        return;
+      }
+      bool success = doc["success"]; // bool
+      if (success)
+      {
+        JsonObject data = doc["data"];
+        currentQueueID = data["id"];                                                // 3
+        currentQueueCode = data["selection_code"].as<String>();                     // "0K9UP7"
+        const char *data_dishes = data["dishes"];                                   // "[21,4,40]"
+        parseStringToSortedArray(data["locations"].as<String>(), locationList, 10); // "[5,3,7]"
+        const char *data_status = data["status"];                                   // "pending"
+        int data_attempts = data["attempts"];                                       // 0
+        const char *data_created_at = data["created_at"];                           // "2025-12-15 11:11:58"
+        Serial.println(locationList[0]);
+        Serial.println(locationList[1]);
+        Serial.println(locationList[2]);
+        runQueue();
+      }
     }
     else
     {
-      Serial.println("Sequence complete!");
-      sequenceRunning = false;
+      Serial.println("Error getting: " + String(httpResponseCode));
     }
+
+    http.end();
+  }
+  else
+  {
+    Serial.println("WiFi not connected");
+  }
+}
+
+int parseStringToSortedArray(const String &input, int output[], int maxSize)
+{
+  int count = 0;
+
+  if (input.length() == 0 || maxSize == 0)
+  {
+    return 0;
+  }
+
+  // Chuyển String sang char array
+  char buffer[input.length() + 1];
+  input.toCharArray(buffer, sizeof(buffer));
+
+  // Dùng strtok để tách chuỗi
+  char *token = strtok(buffer, "[], ");
+
+  while (token != NULL && count < maxSize)
+  {
+    output[count] = atoi(token);
+    count++;
+    token = strtok(NULL, "[], ");
+  }
+
+  // Sắp xếp (dùng qsort cho nhanh)
+  if (count > 1)
+  {
+    qsort(output, count, sizeof(int), [](const void *a, const void *b)
+          { return (*(int *)a - *(int *)b); });
+  }
+
+  return count;
+}
+
+void runQueue()
+{
+  Serial.println("runing for queueid: " + String(currentQueueID) + " with code" + currentQueueCode);
+
+  for (int i = 0; i < 3; i++)
+  {
+    DropPoint cur = dropPoints[locationList[i] - 1];
+    moveToPosition(cur.x, cur.y);
+    activateServo(cur.servoIndex, 1.0);
+  }
+
+  moveToPosition(origin.x, origin.y);
+}
+
+void postQueueComplete()
+{
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    HTTPClient http;
+    String url = "http://" + String(SERVER) + ":" + String(PORT) + String(API) + "?queueid=" + String(currentQueueID);
+    http.begin(url);
+    int httpResponseCode = http.POST("");
+
+    if (httpResponseCode > 0)
+    {
+      String response = http.getString();
+      Serial.println(response);
+    }
+    else
+    {
+      Serial.println("Error getting: " + String(httpResponseCode));
+    }
+
+    http.end();
+  }
+  else
+  {
+    Serial.println("WiFi not connected");
   }
 }
