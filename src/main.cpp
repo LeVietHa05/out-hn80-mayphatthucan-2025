@@ -2,7 +2,7 @@
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 #include <AccelStepper.h>
-// #include <HX711.h>
+#include <HX711.h>
 #include <WiFiManager.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -15,12 +15,12 @@
 #define ENABLE_PIN_X 17
 #define ENABLE_PIN_Y 16
 
-#define LIMIT_SWITCH1_PIN 32 // check
-#define LIMIT_SWITCH2_PIN 33 // check
+#define LIMIT_SWITCH1_PIN 32
+#define LIMIT_SWITCH2_PIN 33
 
 // ===== HX711 Load Cell =====
-#define HX711_DT_PIN 32  // Data pin
-#define HX711_SCK_PIN 33 // Clock pin
+#define HX711_DT_PIN 13  // Data pin
+#define HX711_SCK_PIN 14 // Clock pin
 
 // ===== System Configuration =====
 #define STEPS_PER_ROUND 200
@@ -37,19 +37,24 @@
 #define SERVO_MAX 600                                         // 180° position
 
 // ===== Load Cell Configuration =====
-#define LOAD_CELL_CALIBRATION_FACTOR 1000.0 // Calibration factor (adjust based on your load cell)
+#define LOAD_CELL_CALIBRATION_FACTOR 249.89 // tested
 #define WEIGHT_TOLERANCE 5.0                // Acceptable weight tolerance in grams
 #define MAX_RETRIES 3                       // Maximum number of retry attempts
 #define LOAD_CELL_READINGS 10               // Number of readings to average
+#define MAX_DISPENSE_TIME_MS 30 * 1000      // time in ms
 
-#define SERVER "172.16.30.209"
-#define PORT 3000
-#define API "/api/claim/queue" // get the latest order from server
+#define SERVER "khoetugoc.com"
+#define PORT 443
+#define GET_API "/api/queue"               // get the latest order from server
+#define COMPLETE_API "/api/queue/complete" // send complete order to server
 
-String currentQueueCode = ""; // queue code
-int currentQueueID = 0;       // queue id
-String scurLocations = "";    // string of locationlist
-int locationList[] = {};      // list of drop point + 1
+String menuDate = "";  // date of menu - to complete queue
+String menuType = "";  // type of menu - to complete queue
+String studentId = ""; // studentID of the queue - to complete queue
+String foodSlots = ""; // string of foodSlots  // Format: "2,130;5,200;8,50"
+String studentName = "";
+int locationList[10] = {};     // list of drop point + 1
+int targetWeightList[10] = {}; // list of targetweight
 
 // ===== Drop Point Sequence Configuration =====
 #define NUM_DROP_POINTS 3 // Number of drop points to visit
@@ -67,7 +72,7 @@ AccelStepper stepperX(AccelStepper::DRIVER, STEP_PIN_X, DIR_PIN_X);
 AccelStepper stepperY(AccelStepper::DRIVER, STEP_PIN_Y, DIR_PIN_Y);
 
 // ===== HX711 Load Cell =====
-// HX711 loadCell;
+HX711 loadCell;
 
 // ===== Sequence State =====
 int currentSequenceIndex = 0;
@@ -82,7 +87,7 @@ struct DropPoint
   int servoIndex;
 };
 
-DropPoint origin = {0, 0, 0};
+DropPoint origin = {0, 75, 0};
 
 // ===== Sequence Drop Points =====
 // Define drop points to visit with their target weights
@@ -114,17 +119,18 @@ DropPoint dropPoints[9] = {
 // ===== Function Declarations =====
 void setupServos();
 void setupSteppers();
-// void setupLoadCell();
+void setupLoadCell();
 void moveToPosition(float x, float y);
 void activateServo(int servoIndex, float targetWeight);
 void printStatus();
-// float readLoadCell();
+float readLoadCell();
 bool isWeightSufficient(float weight, float targetWeight);
 bool homeSteppersAdvanced(float homeSpeed = 2000, float maxSpeed = 2000,
                           int backoffDistance = 400, unsigned long timeout = 30000);
 void fetchQueueFromServer();
-int parseStringToSortedArray(const String &input, int output[], int maxSize);
+int parseStringToTwoArrays(const String &input, int locationList[], int targetWeightList[], int maxSize);
 void runQueue();
+void postQueueComplete();
 
 void setup()
 {
@@ -133,7 +139,7 @@ void setup()
 
   // WiFiManager setup
   WiFiManager wm;
-  wm.setConfigPortalTimeout(180); // 3 minutes to configure
+  wm.setConfigPortalTimeout(180);
   if (!wm.autoConnect("KHKT FOOD CATCHER"))
   {
     Serial.println("Failed to connect to WiFi, continuing without WiFi...");
@@ -149,17 +155,25 @@ void setup()
   Wire.begin(22, 21);
 
   // Setup components
-  setupServos();
   setupSteppers();
-  // setupLoadCell();
+  setupServos();
+  setupLoadCell();
 
   // limit switch setup
-  pinMode(LIMIT_SWITCH1_PIN, INPUT_PULLUP);
-  pinMode(LIMIT_SWITCH2_PIN, INPUT_PULLUP);
+  pinMode(LIMIT_SWITCH1_PIN, INPUT);
+  pinMode(LIMIT_SWITCH2_PIN, INPUT);
+  delay(1000);
+
+  int btn1Analog = analogRead(LIMIT_SWITCH1_PIN);
+  int btn2Analog = analogRead(LIMIT_SWITCH2_PIN);
+
+  Serial.print(btn1Analog);
+  Serial.print("    |      ");
+  Serial.println(btn2Analog);
 
   homeSteppersAdvanced(2000);
-
-  Serial.println("System ready! Send coordinates as 'X,Y' (e.g., '100,50')");
+  moveToPosition(origin.x, origin.y);
+  Serial.println("System ready!");
   printStatus();
 }
 
@@ -170,12 +184,12 @@ void loop()
   {
     Serial.println("WiFi disconnected, attempting to reconnect...");
     WiFi.reconnect();
-    delay(5000); // Wait 5 seconds before checking again
+    delay(5000);
   }
   static unsigned long lastCheckServer = 0;
   if (millis() - lastCheckServer > 5000)
   {
-    // fetchQueueFromServer();
+    fetchQueueFromServer();
     lastCheckServer = millis();
   }
 
@@ -186,6 +200,8 @@ void loop()
     {
       DropPoint point = dropPoints[slot];
       moveToPosition(point.x, point.y);
+      activateServo(point.servoIndex, 1.0);
+      moveToPosition(0, 0);
     }
   }
 }
@@ -216,8 +232,8 @@ void setupSteppers()
   Serial.println("Setting up stepper motors...");
 
   // Configure stepper parameters
-  stepperX.setMaxSpeed(3000);     // steps per second
-  stepperX.setAcceleration(1000); // steps per second²
+  stepperX.setMaxSpeed(3000);
+  stepperX.setAcceleration(1000);
   stepperX.setSpeed(200);
   stepperX.setEnablePin(ENABLE_PIN_X);
   stepperX.enableOutputs();
@@ -234,22 +250,32 @@ void setupSteppers()
   Serial.println("Stepper motors ready");
 }
 
-// void setupLoadCell()
-// {
-//   Serial.println("Setting up load cell...");
+void setupLoadCell()
+{
+  Serial.println("Setting up load cell...");
 
-//   // Initialize HX711
-//   loadCell.begin(HX711_DT_PIN, HX711_SCK_PIN);
+  // Initialize HX711
+  loadCell.begin(HX711_DT_PIN, HX711_SCK_PIN);
 
-//   // Set calibration factor (adjust based on your load cell)
-//   loadCell.set_scale(LOAD_CELL_CALIBRATION_FACTOR);
+  // Set calibration factor (adjust based on your load cell)
+  loadCell.set_scale(LOAD_CELL_CALIBRATION_FACTOR);
 
-//   // Tare (zero) the scale
-//   Serial.println("Taring load cell... Please ensure no weight is on the scale.");
-//   loadCell.tare(); // Reset the scale to 0
+  // Tare (zero) the scale
+  Serial.println("Taring load cell... Please ensure no weight is on the scale.");
+  loadCell.tare(); // Reset the scale to 0
 
-//   Serial.println("Load cell ready");
-// }
+  Serial.println("Load cell ready");
+}
+
+float readLoadCell()
+{
+  return loadCell.get_units(LOAD_CELL_READINGS);
+}
+
+bool isWeightSufficient(float weight, float targetWeight)
+{
+  return weight >= (targetWeight - WEIGHT_TOLERANCE);
+}
 
 // move with blocking untill done
 void moveToPosition(float x, float y)
@@ -284,31 +310,58 @@ void activateServo(int servoIndex, float targetWeight)
   {
     Serial.printf("Activating servo %d with load cell verification (target: %.1f g)...\n", servoIndex, targetWeight);
 
-    bool itemDropped = false;
-    int retryCount = 0;
+    float initialWeight = readLoadCell();
+    float targetAbsoluteWeight = initialWeight + targetWeight;
+    Serial.printf("Initial weight: %.1f g, Target total: %.1f g\n", initialWeight, targetAbsoluteWeight);
 
-    // Retry loop
-    // while (!itemDropped && retryCount < MAX_RETRIES)
-    // {
-    Serial.printf("Attempt %d: Opening above servo for 5s...\n", retryCount + 1);
+    int servoAngle = SERVO_MAX / 3;
 
-    // Open above servo (180°) for 5 seconds
-    pwmAbove.setPWM(servoChannelsAbove[servoIndex], 0, SERVO_MAX);
-    delay(5000); // Keep open for 5 seconds
+    Serial.println("Opening both servos at 1/3 max angle...");
+    pwmAbove.setPWM(servoChannelsAbove[servoIndex], 0, servoAngle);
+    pwmBelow.setPWM(servoChannelsBelow[servoIndex], 0, SERVO_MAX / 2);
 
-    // Close above servo (0°)
+    unsigned long startTime = millis();
+    bool weightReached = false;
+
+    while (!weightReached)
+    {
+      float currentWeight = readLoadCell();
+      float dispensedWeight = currentWeight - initialWeight;
+
+      if (isWeightSufficient(dispensedWeight, targetWeight))
+      {
+        weightReached = true;
+        Serial.printf("Target reached! Dispensed: %.1f g (total: %.1f g)\n", dispensedWeight, currentWeight);
+      }
+      else
+      {
+        static unsigned long lastDisplay = 0;
+        if (millis() - lastDisplay > 1000)
+        {
+          Serial.printf("Progress: %.1f/%.1f g (%.0f%%)\n", dispensedWeight, targetWeight, (dispensedWeight / targetWeight) * 100);
+          lastDisplay = millis();
+        }
+      }
+
+      delay(100);
+
+      // Timeout để tránh vòng lặp vô hạn
+      if (millis() - startTime > MAX_DISPENSE_TIME_MS)
+      {
+        Serial.println("Timeout! Stopping dispense.");
+        break;
+      }
+    }
+
+    Serial.println("Closing both servos...");
     pwmAbove.setPWM(servoChannelsAbove[servoIndex], 0, SERVO_MIN);
-
-    Serial.printf("Above servo closed. Opening below servo for 5s...\n");
-
-    // Open below servo (180°) for 5 seconds
-    pwmBelow.setPWM(servoChannelsBelow[servoIndex], 0, SERVO_MAX);
-    delay(5000); // Keep open for 5 seconds
-
-    // Close below servo (0°)
     pwmBelow.setPWM(servoChannelsBelow[servoIndex], 0, SERVO_MIN);
-    delay(2000);
-    Serial.printf("Below servo closed. Checking weight...\n");
+
+    delay(500); // Chờ ổn định
+    float finalWeight = readLoadCell();
+    float actualDispensed = finalWeight - initialWeight;
+
+    Serial.printf("Dispensing completed. Actual dispensed: %.1f g\n", actualDispensed);
   }
 }
 
@@ -320,11 +373,6 @@ void printStatus()
   //   Serial.printf(" -> Target: (%.1f, %.1f) mm", targetPos.x, targetPos.y);
   // }
   Serial.println();
-}
-
-bool isWeightSufficient(float weight, float targetWeight)
-{
-  return weight >= (targetWeight - WEIGHT_TOLERANCE);
 }
 
 bool homeSteppersAdvanced(float homeSpeed, float maxSpeed,
@@ -344,7 +392,7 @@ bool homeSteppersAdvanced(float homeSpeed, float maxSpeed,
 
   // Bắt đầu di chuyển về phía công tắc
   stepperX.move(1000000);
-  stepperY.move(-1000000);
+  stepperY.move(-1000000); // yes, reverse
 
   while (!(home1 && home2))
   {
@@ -360,7 +408,9 @@ bool homeSteppersAdvanced(float homeSpeed, float maxSpeed,
     // Kiểm tra công tắc
     if (!home1)
     {
-      if (digitalRead(LIMIT_SWITCH1_PIN) == LOW)
+      int a = analogRead(LIMIT_SWITCH1_PIN);
+      Serial.println(a);
+      if (a == 0)
       {
         stepperX.stop();
         stepperX.setCurrentPosition(0);
@@ -375,7 +425,9 @@ bool homeSteppersAdvanced(float homeSpeed, float maxSpeed,
 
     if (!home2)
     {
-      if (digitalRead(LIMIT_SWITCH2_PIN) == LOW)
+      int b = analogRead(LIMIT_SWITCH2_PIN);
+      Serial.println(b);
+      if (b == 0)
       {
         stepperY.stop();
         stepperY.setCurrentPosition(0);
@@ -424,7 +476,7 @@ void fetchQueueFromServer()
   if (WiFi.status() == WL_CONNECTED)
   {
     HTTPClient http;
-    String url = "http://" + String(SERVER) + ":" + String(PORT) + String(API);
+    String url = "https://" + String(SERVER) + ":" + String(PORT) + String(GET_API);
     http.begin(url);
     int httpResponseCode = http.GET();
 
@@ -442,21 +494,25 @@ void fetchQueueFromServer()
         Serial.println(error.c_str());
         return;
       }
-      bool success = doc["success"]; // bool
+      bool success = doc["hasItem"]; // bool
       if (success)
       {
-        JsonObject data = doc["data"];
-        currentQueueID = data["id"];                                                // 3
-        currentQueueCode = data["selection_code"].as<String>();                     // "0K9UP7"
-        const char *data_dishes = data["dishes"];                                   // "[21,4,40]"
-        parseStringToSortedArray(data["locations"].as<String>(), locationList, 10); // "[5,3,7]"
-        const char *data_status = data["status"];                                   // "pending"
-        int data_attempts = data["attempts"];                                       // 0
-        const char *data_created_at = data["created_at"];                           // "2025-12-15 11:11:58"
-        Serial.println(locationList[0]);
-        Serial.println(locationList[1]);
-        Serial.println(locationList[2]);
+        JsonObject data = doc["item"];
+        studentId = data["studentId"].as<String>();
+        studentName = data["studentName"].as<String>();
+        menuDate = data["date"].as<String>();
+        menuType = data["type"].as<String>();
+        String status = data["status"].as<String>();
+        String menuName = data["menuName"].as<String>();
+        parseStringToTwoArrays(data["foodSlots"].as<String>(), locationList, targetWeightList, 10); // "2,130;5,200;8,50"
+        Serial.println(locationList[0]);                                                            // 2
+        Serial.println(locationList[1]);                                                            // 5
+        Serial.println(locationList[2]);                                                            // 8
         runQueue();
+      }
+      else
+      {
+        Serial.println("no Queue found");
       }
     }
     else
@@ -472,49 +528,36 @@ void fetchQueueFromServer()
   }
 }
 
-int parseStringToSortedArray(const String &input, int output[], int maxSize)
+int parseStringToTwoArrays(const String &input, int locationList[], int targetWeightList[], int maxSize)
 {
   int count = 0;
-
-  if (input.length() == 0 || maxSize == 0)
-  {
-    return 0;
-  }
-
-  // Chuyển String sang char array
   char buffer[input.length() + 1];
   input.toCharArray(buffer, sizeof(buffer));
 
-  // Dùng strtok để tách chuỗi
-  char *token = strtok(buffer, "[], ");
-
-  while (token != NULL && count < maxSize)
+  char *pairToken = strtok(buffer, ";");
+  while (pairToken != NULL && count < maxSize)
   {
-    output[count] = atoi(token);
-    count++;
-    token = strtok(NULL, "[], ");
+    // sscanf sẽ tìm 2 số nguyên cách nhau bởi dấu phẩy
+    if (sscanf(pairToken, "%d,%d", &locationList[count], &targetWeightList[count]) == 2)
+    {
+      count++;
+    }
+    pairToken = strtok(NULL, ";");
   }
-
-  // Sắp xếp (dùng qsort cho nhanh)
-  if (count > 1)
-  {
-    qsort(output, count, sizeof(int), [](const void *a, const void *b)
-          { return (*(int *)a - *(int *)b); });
-  }
-
   return count;
 }
 
 void runQueue()
 {
-  Serial.println("runing for queueid: " + String(currentQueueID) + " with code" + currentQueueCode);
+  Serial.println("runing for queue: " + menuDate + " with type " + menuType + " for: " + studentName);
 
   for (int i = 0; i < 3; i++)
   {
     DropPoint cur = dropPoints[locationList[i] - 1];
     moveToPosition(cur.x, cur.y);
-    activateServo(cur.servoIndex, 1.0);
+    activateServo(cur.servoIndex, targetWeightList[i]);
   }
+  postQueueComplete();
 
   moveToPosition(origin.x, origin.y);
 }
@@ -524,7 +567,7 @@ void postQueueComplete()
   if (WiFi.status() == WL_CONNECTED)
   {
     HTTPClient http;
-    String url = "http://" + String(SERVER) + ":" + String(PORT) + String(API) + "?queueid=" + String(currentQueueID);
+    String url = "https://" + String(SERVER) + ":" + String(PORT) + String(COMPLETE_API) + "?date=" + menuDate + "&type=" + menuType + "&studentId=" + studentId;
     http.begin(url);
     int httpResponseCode = http.POST("");
 
