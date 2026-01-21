@@ -35,10 +35,11 @@
 #define MAX_Y_MM 310                                          // Maximum Y travel in mm
 #define SERVO_MIN 150                                         // 0° position
 #define SERVO_MAX 600                                         // 180° position
+#define MAXSERVOSPEED 3500
 
 // ===== Load Cell Configuration =====
 #define LOAD_CELL_CALIBRATION_FACTOR 249.89 // tested
-#define WEIGHT_TOLERANCE 5.0                // Acceptable weight tolerance in grams
+#define WEIGHT_TOLERANCE 50.0               // Acceptable weight tolerance in grams
 #define MAX_RETRIES 3                       // Maximum number of retry attempts
 #define LOAD_CELL_READINGS 10               // Number of readings to average
 #define MAX_DISPENSE_TIME_MS 30 * 1000      // time in ms
@@ -107,7 +108,7 @@ int numSequencePoints = 0;
 DropPoint dropPoints[9] = {
     {560, 150, 0}, // Position 1 -> Servo 0
     {370, 150, 1}, // Position 2 -> Servo 1
-    {190, 140, 2}, // Position 3 -> Servo 2
+    {190, 150, 2}, // Position 3 -> Servo 2
     {560, 75, 3},  // Position 4 -> Servo 3
     {370, 75, 4},  // Position 5 -> Servo 4
     {190, 75, 5},  // Position 6 -> Servo 5
@@ -125,8 +126,8 @@ void activateServo(int servoIndex, float targetWeight);
 void printStatus();
 float readLoadCell();
 bool isWeightSufficient(float weight, float targetWeight);
-bool homeSteppersAdvanced(float homeSpeed = 2000, float maxSpeed = 2000,
-                          int backoffDistance = 400, unsigned long timeout = 30000);
+bool homeSteppersAdvanced(float homeSpeed = 2000, float maxSpeed = 3000,
+                          int backoffDistance = 400, unsigned long timeout = 60000);
 void fetchQueueFromServer();
 int parseStringToTwoArrays(const String &input, int locationList[], int targetWeightList[], int maxSize);
 void runQueue();
@@ -171,7 +172,8 @@ void setup()
   Serial.print("    |      ");
   Serial.println(btn2Analog);
 
-  homeSteppersAdvanced(2000);
+  homeSteppersAdvanced();
+  moveToPosition(560, 150);
   moveToPosition(origin.x, origin.y);
   Serial.println("System ready!");
   printStatus();
@@ -193,17 +195,17 @@ void loop()
     lastCheckServer = millis();
   }
 
-  if (Serial.available())
-  {
-    int slot = Serial.readStringUntil('\n').toInt();
-    if (slot >= 0 && slot <= 8)
-    {
-      DropPoint point = dropPoints[slot];
-      moveToPosition(point.x, point.y);
-      activateServo(point.servoIndex, 1.0);
-      moveToPosition(0, 0);
-    }
-  }
+  // if (Serial.available())
+  // {
+  //   int slot = Serial.readStringUntil('\n').toInt();
+  //   if (slot >= 0 && slot <= 8)
+  //   {
+  //     DropPoint point = dropPoints[slot];
+  //     moveToPosition(point.x, point.y);
+  //     activateServo(point.servoIndex, 1.0);
+  //     moveToPosition(0, 0);
+  //   }
+  // }
 }
 
 void setupServos()
@@ -232,15 +234,15 @@ void setupSteppers()
   Serial.println("Setting up stepper motors...");
 
   // Configure stepper parameters
-  stepperX.setMaxSpeed(3000);
+  stepperX.setMaxSpeed(MAXSERVOSPEED);
   stepperX.setAcceleration(1000);
-  stepperX.setSpeed(200);
+  stepperX.setSpeed(2000);
   stepperX.setEnablePin(ENABLE_PIN_X);
   stepperX.enableOutputs();
 
-  stepperY.setMaxSpeed(3000);
+  stepperY.setMaxSpeed(MAXSERVOSPEED);
   stepperY.setAcceleration(1000);
-  stepperY.setSpeed(200);
+  stepperY.setSpeed(2000);
   stepperY.setEnablePin(ENABLE_PIN_Y);
   stepperY.enableOutputs();
 
@@ -314,11 +316,19 @@ void activateServo(int servoIndex, float targetWeight)
     float targetAbsoluteWeight = initialWeight + targetWeight;
     Serial.printf("Initial weight: %.1f g, Target total: %.1f g\n", initialWeight, targetAbsoluteWeight);
 
-    int servoAngle = SERVO_MAX / 3;
+    int servoAngle = SERVO_MAX * 1 / 2;
 
     Serial.println("Opening both servos at 1/3 max angle...");
-    pwmAbove.setPWM(servoChannelsAbove[servoIndex], 0, servoAngle);
-    pwmBelow.setPWM(servoChannelsBelow[servoIndex], 0, SERVO_MAX / 2);
+    if (servoIndex >= 6)
+    {
+      pwmAbove.setPWM(servoChannelsAbove[servoIndex], 0, SERVO_MAX * 1 / 3);
+      pwmBelow.setPWM(servoChannelsBelow[servoIndex], 0, SERVO_MAX * 1 / 3);
+    }
+    else
+    {
+      pwmAbove.setPWM(servoChannelsAbove[servoIndex], 0, servoAngle);
+      pwmBelow.setPWM(servoChannelsBelow[servoIndex], 0, servoAngle);
+    }
 
     unsigned long startTime = millis();
     bool weightReached = false;
@@ -386,9 +396,7 @@ bool homeSteppersAdvanced(float homeSpeed, float maxSpeed,
 
   // Thiết lập tốc độ homing
   stepperX.setMaxSpeed(maxSpeed);
-  stepperX.setSpeed(homeSpeed);
   stepperY.setMaxSpeed(maxSpeed);
-  stepperY.setSpeed(homeSpeed);
 
   // Bắt đầu di chuyển về phía công tắc
   stepperX.move(1000000);
@@ -409,7 +417,7 @@ bool homeSteppersAdvanced(float homeSpeed, float maxSpeed,
     if (!home1)
     {
       int a = analogRead(LIMIT_SWITCH1_PIN);
-      Serial.println(a);
+      // Serial.println(a);
       if (a == 0)
       {
         stepperX.stop();
@@ -426,7 +434,7 @@ bool homeSteppersAdvanced(float homeSpeed, float maxSpeed,
     if (!home2)
     {
       int b = analogRead(LIMIT_SWITCH2_PIN);
-      Serial.println(b);
+      // Serial.println(b);
       if (b == 0)
       {
         stepperY.stop();
@@ -447,8 +455,8 @@ bool homeSteppersAdvanced(float homeSpeed, float maxSpeed,
   Serial.println("Đang di chuyển ra khỏi công tắc...");
 
   // Di chuyển ngược lại với tốc độ chậm hơn
-  stepperX.setSpeed(homeSpeed / 2);
-  stepperY.setSpeed(homeSpeed / 2);
+  stepperX.setSpeed(homeSpeed);
+  stepperY.setSpeed(homeSpeed);
 
   stepperX.move(-backoffDistance);
   stepperY.move(backoffDistance);
@@ -464,8 +472,8 @@ bool homeSteppersAdvanced(float homeSpeed, float maxSpeed,
   stepperY.setCurrentPosition(0);
 
   // Khôi phục tốc độ mặc định
-  stepperX.setMaxSpeed(3000);
-  stepperY.setMaxSpeed(3000);
+  stepperX.setMaxSpeed(MAXSERVOSPEED);
+  stepperY.setMaxSpeed(MAXSERVOSPEED);
 
   Serial.println("=== Homing hoàn tất thành công ===");
   return true;
