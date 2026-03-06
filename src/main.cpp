@@ -6,6 +6,7 @@
 #include <WiFiManager.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include "menudata.h"
 
 // ===== Pin Definitions =====
 #define STEP_PIN_X 19
@@ -22,6 +23,16 @@
 #define HX711_DT_PIN 13  // Data pin
 #define HX711_SCK_PIN 14 // Clock pin
 
+// === L298 PIN (PCA PIN) === //
+#define L298_1_1 15
+#define L298_1_2 14
+#define L298_1_3 13
+#define L298_1_4 12
+#define L298_2_1 15
+#define L298_2_2 14
+#define L298_2_3 13
+#define L298_2_4 12
+
 // ===== System Configuration =====
 #define STEPS_PER_ROUND 200
 #define MICROSTEP 4 // MS2, MS1: 00: 1/8, 01: 1/32, 10: 1/64 11: 1/16
@@ -35,7 +46,7 @@
 #define MAX_Y_MM 310                                          // Maximum Y travel in mm
 #define SERVO_MIN 150                                         // 0° position
 #define SERVO_MAX 600                                         // 180° position
-#define MAXSERVOSPEED 3500
+#define MAXSERVOSPEED 3000
 
 // ===== Load Cell Configuration =====
 #define LOAD_CELL_CALIBRATION_FACTOR 249.89 // tested
@@ -558,6 +569,15 @@ int parseStringToTwoArrays(const String &input, int locationList[], int targetWe
 void runQueue()
 {
   Serial.println("runing for queue: " + menuDate + " with type " + menuType + " for: " + studentName);
+  // khoi dong bo khuay
+  pwmAbove.setPWM(L298_1_1, 0, 0);
+  pwmAbove.setPWM(L298_1_2, 0, 4095);
+  pwmAbove.setPWM(L298_1_3, 0, 0);
+  pwmAbove.setPWM(L298_1_4, 0, 4095);
+  pwmBelow.setPWM(L298_2_1, 0, 0);
+  pwmBelow.setPWM(L298_2_2, 0, 4095);
+  pwmAbove.setPWM(L298_2_3, 0, 0);
+  pwmAbove.setPWM(L298_2_4, 0, 4095);
 
   for (int i = 0; i < 3; i++)
   {
@@ -565,6 +585,17 @@ void runQueue()
     moveToPosition(cur.x, cur.y);
     activateServo(cur.servoIndex, targetWeightList[i]);
   }
+
+  // dung bo khuay
+  pwmAbove.setPWM(L298_1_1, 0, 0);
+  pwmAbove.setPWM(L298_1_2, 0, 0);
+  pwmAbove.setPWM(L298_1_3, 0, 0);
+  pwmAbove.setPWM(L298_1_4, 0, 0);
+  pwmBelow.setPWM(L298_2_1, 0, 0);
+  pwmBelow.setPWM(L298_2_2, 0, 0);
+  pwmBelow.setPWM(L298_2_3, 0, 0);
+  pwmBelow.setPWM(L298_2_4, 0, 0);
+
   postQueueComplete();
 
   moveToPosition(origin.x, origin.y);
