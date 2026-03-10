@@ -143,6 +143,7 @@ void fetchQueueFromServer();
 int parseStringToTwoArrays(const String &input, int locationList[], int targetWeightList[], int maxSize);
 void runQueue();
 void postQueueComplete();
+void setMixerDirection(bool dir);
 
 void setup()
 {
@@ -570,17 +571,12 @@ void runQueue()
 {
   Serial.println("runing for queue: " + menuDate + " with type " + menuType + " for: " + studentName);
   // khoi dong bo khuay
-  pwmAbove.setPWM(L298_1_1, 0, 0);
-  pwmAbove.setPWM(L298_1_2, 0, 4095);
-  pwmAbove.setPWM(L298_1_3, 0, 0);
-  pwmAbove.setPWM(L298_1_4, 0, 4095);
-  pwmBelow.setPWM(L298_2_1, 0, 0);
-  pwmBelow.setPWM(L298_2_2, 0, 4095);
-  pwmAbove.setPWM(L298_2_3, 0, 0);
-  pwmAbove.setPWM(L298_2_4, 0, 4095);
+  bool direction = true;
 
   for (int i = 0; i < 3; i++)
   {
+    setMixerDirection(direction);
+    direction = !direction;
     DropPoint cur = dropPoints[locationList[i] - 1];
     moveToPosition(cur.x, cur.y);
     activateServo(cur.servoIndex, targetWeightList[i]);
@@ -625,5 +621,33 @@ void postQueueComplete()
   else
   {
     Serial.println("WiFi not connected");
+  }
+}
+
+void setMixerDirection(bool dir)
+{
+  if (dir) // thuận
+  {
+    pwmAbove.setPWM(L298_1_1, 0, 0);
+    pwmAbove.setPWM(L298_1_2, 0, 4095);
+    pwmAbove.setPWM(L298_1_3, 0, 0);
+    pwmAbove.setPWM(L298_1_4, 0, 4095);
+
+    pwmBelow.setPWM(L298_2_1, 0, 0);
+    pwmBelow.setPWM(L298_2_2, 0, 4095);
+    pwmBelow.setPWM(L298_2_3, 0, 0);
+    pwmBelow.setPWM(L298_2_4, 0, 4095);
+  }
+  else // ngược
+  {
+    pwmAbove.setPWM(L298_1_1, 0, 4095);
+    pwmAbove.setPWM(L298_1_2, 0, 0);
+    pwmAbove.setPWM(L298_1_3, 0, 4095);
+    pwmAbove.setPWM(L298_1_4, 0, 0);
+
+    pwmBelow.setPWM(L298_2_1, 0, 4095);
+    pwmBelow.setPWM(L298_2_2, 0, 0);
+    pwmBelow.setPWM(L298_2_3, 0, 4095);
+    pwmBelow.setPWM(L298_2_4, 0, 0);
   }
 }
